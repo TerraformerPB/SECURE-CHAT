@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#161b22">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="SecureChat">
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="icon-192.png" sizes="192x192">
+  <link rel="apple-touch-icon" href="icon-192.png">
+  <title>SecureChat</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="login-container">
+    <div class="login-card">
+      <h1>SecureChat</h1>
+      <p class="subtitle">Ende-zu-Ende verschlüsselt</p>
+      <div class="input-group">
+        <label for="username-input">Benutzername</label>
+        <input type="text" id="username-input" placeholder="Dein Name" maxlength="30" autocomplete="off">
+      </div>
+      <div class="input-group">
+        <label for="server-input">Server</label>
+        <input type="text" id="server-input" value="" placeholder="Server-URL (leer = gleicher Server)">
+      </div>
+      <button id="connect-btn" class="btn-primary">Verbinden</button>
+      <p class="status-text" id="login-status"></p>
+    </div>
+  </div>
+
+  <div id="chat-container" style="display:none;">
+    <div class="chat-header">
+      <div class="header-left">
+        <h2>SecureChat</h2>
+        <span class="badge" id="e2e-badge">🔒 E2E</span>
+      </div>
+      <div class="header-center">
+        <span id="chat-partner-name">Niemand ausgewählt</span>
+        <span class="online-indicator" id="partner-status"></span>
+      </div>
+      <div class="header-right">
+        <button id="storage-toggle-btn" class="btn-icon" title="Chat-Verlauf speichern">💾</button>
+        <button id="emergency-delete-btn" class="btn-danger" title="Notfall-Löschung">🗑️</button>
+      </div>
+    </div>
+
+    <div class="chat-body">
+      <div class="users-panel">
+        <div class="panel-header">
+          <h3>Online</h3>
+          <button id="create-group-btn" class="btn-icon" title="Gruppe erstellen">👥</button>
+        </div>
+        <div id="group-list"></div>
+        <ul id="user-list"></ul>
+      </div>
+      <div class="messages-panel">
+        <div id="messages-container"></div>
+        <div class="message-input-area">
+          <textarea id="message-input" placeholder="Nachricht eingeben..." rows="2" disabled></textarea>
+          <button id="file-btn" class="btn-icon" title="Datei senden" disabled>📎</button>
+          <button id="send-btn" class="btn-primary" disabled>Senden</button>
+        </div>
+        <p class="status-text" id="chat-status"></p>
+      </div>
+    </div>
+  </div>
+
+  <div id="storage-consent-modal" class="modal" style="display:none;">
+    <div class="modal-content">
+      <h3>💾 Chat-Verlauf speichern?</h3>
+      <p id="storage-consent-text">Dein Chatpartner möchte den verschlüsselten Verlauf lokal speichern.</p>
+      <p class="warning" style="font-size:13px;">Der Verlauf wird AES-verschlüsselt in localStorage abgelegt und ist nur für euch beide lesbar.</p>
+      <div class="modal-actions">
+        <button id="storage-consent-deny" class="btn-secondary">Ablehnen</button>
+        <button id="storage-consent-accept" class="btn-primary">Akzeptieren</button>
+      </div>
+    </div>
+  </div>
+
+  <input type="file" id="file-input" style="display:none" multiple>
+
+  <div id="group-modal" class="modal" style="display:none;">
+    <div class="modal-content">
+      <h3>👥 Gruppe erstellen</h3>
+      <div class="input-group">
+        <label>Gruppenname</label>
+        <input type="text" id="group-name-input" placeholder="Gruppenname" maxlength="30">
+      </div>
+      <p style="font-size:13px;color:#8b949e;margin-bottom:8px;">Mitglieder auswählen:</p>
+      <div id="group-member-list" class="member-select-list"></div>
+      <div class="modal-actions">
+        <button id="group-cancel-btn" class="btn-secondary">Abbrechen</button>
+        <button id="group-create-btn" class="btn-primary">Erstellen</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="delete-modal" class="modal" style="display:none;">
+    <div class="modal-content">
+      <h3>🔴 Notfall-Löschung</h3>
+      <p>Der gesamte Chat wird lokal gelöscht <strong>und</strong> eine Löschaufforderung an deinen Chatpartner gesendet.</p>
+      <p class="warning">Diese Aktion kann nicht rückgängig gemacht werden!</p>
+      <div class="modal-actions">
+        <button id="delete-cancel-btn" class="btn-secondary">Abbrechen</button>
+        <button id="delete-confirm-btn" class="btn-danger">Chat unwiderruflich löschen</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');
+  </script>
+  <script src="app.js"></script>
+</body>
+</html>
