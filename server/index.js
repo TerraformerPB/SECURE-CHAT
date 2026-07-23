@@ -138,6 +138,8 @@ wss.on('connection', (ws) => {
             iv: msg.iv,
             timestamp: msg.timestamp,
             subType: msg.subType || null,
+            pubKeyTemp: msg.pubKeyTemp || null,
+            encryptedPad: msg.encryptedPad || null,
             otpData: msg.otpData || null
           }));
           break;
@@ -152,7 +154,8 @@ wss.on('connection', (ws) => {
             fileName: msg.fileName, fileIv: msg.fileIv,
             fileSize: msg.fileSize, totalChunks: msg.totalChunks,
             encryptedData: msg.encryptedData, iv: msg.iv,
-            chunkIndex: msg.chunkIndex
+            chunkIndex: msg.chunkIndex,
+            transferId: msg.transferId || null
           }));
           break;
         }
@@ -195,7 +198,7 @@ wss.on('connection', (ws) => {
           const memberList = [];
           for (const mid of members) {
             const c = clients.get(mid);
-            if (c) memberList.push({ userId: mid, username: c.username });
+            if (c) memberList.push({ userId: mid, username: c.username, publicKey: c.publicKey });
           }
           groups.set(groupId, { name: msg.name || 'Gruppe', creator: userId, members, memberList });
           for (const mid of members) {
@@ -232,7 +235,8 @@ wss.on('connection', (ws) => {
                 fileName: msg.fileName, fileIv: msg.fileIv,
                 fileSize: msg.fileSize, totalChunks: msg.totalChunks,
                 encryptedData: msg.encryptedData, iv: msg.iv,
-                chunkIndex: msg.chunkIndex
+                chunkIndex: msg.chunkIndex,
+                transferId: msg.transferId || null
               }));
             }
           }
@@ -249,7 +253,9 @@ wss.on('connection', (ws) => {
               c.ws.send(JSON.stringify({
                 type: 'group_message', groupId: msg.groupId,
                 senderUserId: userId, senderUsername: username,
-                encryptedData: msg.encryptedData, iv: msg.iv, timestamp: msg.timestamp
+                encryptedData: msg.encryptedData, iv: msg.iv,
+                groupHash: msg.groupHash || null,
+                timestamp: msg.timestamp
               }));
             }
           }

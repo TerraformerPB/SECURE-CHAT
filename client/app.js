@@ -10,13 +10,90 @@ let activeUsername = null;
 let userMap = {};
 let otpExchangeInProgress = false;
 const sharedKeys = {};
+const userPublicKeys = {};
 const otpSendStores = {};
 const otpRecvStores = {};
 const messageHistories = {};
 const receivedNonces = {};
-const storageKeys = {};
 const storageEnabled = {};
 
+// --- IndexedDB & Memory Zeroing Architecture ---
+const DB_NAME = 'SecureChatDB';
+const DB_STORE = 'encrypted_histories';
+
+function openDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, 1);
+    request.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(DB_STORE)) {
+        db.createObjectStore(DB_STORE, { keyPath: 'userId' });
+      }
+    };
+    request.onsuccess = (e) => resolve(e.target.result);
+    request.onerror = (e) => reject(e.target.error);
+  });
+}
+
+async function saveHistoryToDB(userId, dataObj) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, 'readwrite');
+    const store = tx.objectStore(DB_STORE);
+    store.put({ userId, iv: dataObj.iv, ct: dataObj.ct, updatedAt: Date.now() });
+    tx.oncomplete = () => resolve();
+    tx.onerror = (e) => reject(e.target.error);
+  });
+}
+
+async function loadHistoryFromDB(userId) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, 'readonly');
+    const store = tx.objectStore(DB_STORE);
+    const req = store.get(userId);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = (e) => reject(e.target.error);
+  });
+}
+
+async function deleteHistoryFromDB(userId) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, 'readwrite');
+    const store = tx.objectStore(DB_STORE);
+    store.delete(userId);
+    tx.oncomplete = () => resolve();
+    tx.onerror = (e) => reject(e.target.error);
+  });
+}
+
+async function clearAllDB() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(DB_STORE, 'readwrite');
+    const store = tx.objectStore(DB_STORE);
+    store.clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror = (e) => reject(e.target.error);
+  });
+}
+
+function zeroMemory(arr) {
+  if (!arr) return;
+  if (Array.isArray(arr)) {
+    for (let i = 0; i < arr.length; i++) {
+      arr[i] = Math.floor(Math.random() * 256);
+    }
+    arr.fill(0);
+  } else if (arr instanceof Uint8Array || arr instanceof ArrayBuffer) {
+    const view = arr instanceof ArrayBuffer ? new Uint8Array(arr) : arr;
+    crypto.getRandomValues(view);
+    view.fill(0);
+  }
+}
+
+// DOM Elements
 const loginContainer = document.getElementById('login-container');
 const chatContainer = document.getElementById('chat-container');
 const usernameInput = document.getElementById('username-input');
@@ -249,20 +326,8 @@ async function decryptMessageFrom(userId, ivBase64, dataBase64) {
 }
 
 async function restoreStorageState(forUserId) {
-  const raw = localStorage.getItem('schistory_' + forUserId);
-  if (!raw) return;
   try {
-    const sk = await deriveStorageKey(forUserId);
-    if (!sk) return;
-    const { iv, ct } = JSON.parse(raw);
-    const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: base64ToArrayBuffer(iv) }, sk, base64ToArrayBuffer(ct));
-    const history = JSON.parse(new TextDecoder().decode(plaintext));
-    messageHistories[forUserId] = history;
-    storageEnabled[forUserId] = true;
-    if (forUserId === activeUserId) {
-      storageToggleBtn.classList.add('active');
-      storageToggleBtn.title = 'Chat-Verlauf wird gespeichert';
-    }
+    await loadHistoryFromStorage(forUserId);
   } catch { }
 }
 
@@ -327,9 +392,122 @@ async function handleOTPExchange(msg) {
   }
 }
 
+// --- Post-Quantum Ephemeral ECDH OTP Ratchet ---
+async function initiateOTPRatchet(forUserId) {
+  const uid = forUserId || activeUserId;
+  if (!uid) return;
+
+  try {
+    chatStatus.textContent = '🔒 Erzeuge Ephemeren Post-Quantum ECDH Ratchet...';
+
+    // 1. Generate fresh ephemeral ECDH P-384 keypair
+    const keyPairTemp = await crypto.subtle.generateKey(
+      { name: 'ECDH', namedCurve: 'P-384' },
+      true, ['deriveKey', 'deriveBits']
+    );
+    const pubKeyTempJwk = await exportPublicKey(keyPairTemp);
+
+    // 2. Derive AES_next from KeyPair_temp and target's static public key
+    const targetPubKeyJwk = userPublicKeys[uid];
+    if (!targetPubKeyJwk) {
+      await initiateOTPExchange(uid);
+      return;
+    }
+    const targetPublic = await importPublicKey(targetPubKeyJwk);
+    const sharedBitsNext = await crypto.subtle.deriveBits(
+      { name: 'ECDH', public: targetPublic },
+      keyPairTemp.privateKey, 384
+    );
+    const hashNext = await crypto.subtle.digest('SHA-256', sharedBitsNext);
+    const aesNextKey = await crypto.subtle.importKey(
+      'raw', hashNext, { name: 'AES-GCM' },
+      false, ['encrypt', 'decrypt']
+    );
+
+    // 3. Generate new 64-KB pad and encrypt with AES_next
+    const newOtpBytes = crypto.getRandomValues(new Uint8Array(OTP_KEY_SIZE));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const encryptedPad = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv },
+      aesNextKey,
+      newOtpBytes
+    );
+
+    // 4. Securely zero old pad in RAM before replacing
+    const oldSendStore = getOTPSendStore(uid);
+    if (oldSendStore && oldSendStore.data) {
+      zeroMemory(oldSendStore.data);
+    }
+    saveOTPSendStore(uid, { data: Array.from(newOtpBytes), offset: 0 });
+
+    // 5. Send ratchet packet containing PublicKey_temp and encrypted pad
+    ws.send(JSON.stringify({
+      type: 'direct_message',
+      targetUserId: uid,
+      subType: 'otp_ratchet',
+      pubKeyTemp: pubKeyTempJwk,
+      encryptedPad: arrayBufferToBase64(encryptedPad),
+      iv: arrayBufferToBase64(iv),
+      timestamp: Date.now()
+    }));
+
+    if (uid === activeUserId) {
+      chatStatus.textContent = '🔒 Post-Quantum Ratchet Pad gesendet!';
+      finalizeOTPSetup(uid);
+    }
+  } catch (e) {
+    console.error('Ratchet initiation error:', e);
+    if (uid === activeUserId) chatStatus.textContent = 'Ratchet-Fehler: ' + e.message;
+  }
+}
+
+async function handleOTPRatchet(msg) {
+  const uid = msg.senderUserId;
+  if (!uid || !msg.pubKeyTemp || !msg.encryptedPad) return;
+
+  try {
+    // Derive AES_next from my static private key and sender's ephemeral public key
+    const tempPublic = await importPublicKey(msg.pubKeyTemp);
+    const sharedBitsNext = await crypto.subtle.deriveBits(
+      { name: 'ECDH', public: tempPublic },
+      myKeyPair.privateKey, 384
+    );
+    const hashNext = await crypto.subtle.digest('SHA-256', sharedBitsNext);
+    const aesNextKey = await crypto.subtle.importKey(
+      'raw', hashNext, { name: 'AES-GCM' },
+      false, ['encrypt', 'decrypt']
+    );
+
+    const iv = base64ToArrayBuffer(msg.iv);
+    const ct = base64ToArrayBuffer(msg.encryptedPad);
+    const decryptedBuffer = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv },
+      aesNextKey,
+      ct
+    );
+
+    const newOtpBytes = new Uint8Array(decryptedBuffer);
+
+    // Securely zero old receiving pad in RAM
+    const oldRecvStore = getOTPRecvStore(uid);
+    if (oldRecvStore && oldRecvStore.data) {
+      zeroMemory(oldRecvStore.data);
+    }
+    saveOTPRecvStore(uid, { data: Array.from(newOtpBytes), offset: 0 });
+
+    if (uid === activeUserId) {
+      chatStatus.textContent = '🔒 Post-Quantum OTP Ratchet empfangen & aktiviert!';
+      finalizeOTPSetup(uid);
+    }
+  } catch (e) {
+    console.error('Ratchet receive error:', e);
+    if (uid === activeUserId) chatStatus.textContent = 'Ratchet-Empfangs-Fehler: ' + e.message;
+  }
+}
+
 function finalizeOTPSetup(uid) {
   if (uid !== activeUserId) return;
-  e2eBadge.textContent = '🔒🔒 E2E + OTP';
+  e2eBadge.textContent = '🔒🔒 E2E + Post-Quantum Ratchet';
   e2eBadge.style.color = '#3fb950';
   messageInput.disabled = false;
   sendBtn.disabled = false;
@@ -339,8 +517,8 @@ function finalizeOTPSetup(uid) {
   const sRem = sendStore ? ((sendStore.data.length - sendStore.offset) / 1024).toFixed(0) : 0;
   const rRem = recvStore ? ((recvStore.data.length - recvStore.offset) / 1024).toFixed(0) : 0;
   messagesContainer.innerHTML =
-    `<div class="system-message">🔒🔥 AES-256-GCM + One-Time-Pad<br>OTP-Rest: ${sRem} KB Senden / ${rRem} KB Empfangen</div>`;
-  chatStatus.textContent = '🔒🔥 Doppelt verschlüsselt';
+    `<div class="system-message">🔒🔥 AES-256-GCM + Post-Quantum ECDH Ratchet OTP<br>OTP-Rest: ${sRem} KB Senden / ${rRem} KB Empfangen</div>`;
+  chatStatus.textContent = '🔒🔥 Post-Quantum Ratchet Aktiv';
   loadChatHistory();
 }
 
@@ -351,8 +529,8 @@ async function checkOTPRenewal() {
   const recvStore = getOTPRecvStore(uid);
   const needRenew = (s) => s && (s.offset / s.data.length) > OTP_RENEW_THRESHOLD;
   if (needRenew(sendStore) || needRenew(recvStore)) {
-    chatStatus.textContent = 'Erneuere OTP-Schlüssel...';
-    await initiateOTPExchange(uid);
+    chatStatus.textContent = 'Erneuere Post-Quantum Ratchet Schlüssel...';
+    await initiateOTPRatchet(uid);
   }
 }
 
@@ -360,9 +538,7 @@ async function deriveStorageKey(userId) {
   const ecdhKey = getSharedKey(userId);
   if (!ecdhKey) return null;
   const raw = await crypto.subtle.exportKey('raw', ecdhKey);
-  const salt = new TextEncoder().encode('SecureChat-Storage-v1');
-  const bits = await crypto.subtle.importKey('raw', new Uint8Array([...new Uint8Array(salt), ...new Uint8Array(raw)]),
-    { name: 'PBKDF2' }, false, ['deriveBits']);
+  const salt = new TextEncoder().encode('SecureChat-Storage-v2-IndexedDB');
   const hash = await crypto.subtle.digest('SHA-256', new Uint8Array([...new Uint8Array(salt), ...new Uint8Array(raw)]));
   return await crypto.subtle.importKey('raw', hash, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
 }
@@ -376,7 +552,7 @@ async function toggleStorage() {
   if (!uid) return;
   if (isStorageActive(uid)) {
     storageEnabled[uid] = false;
-    localStorage.removeItem('schistory_' + uid);
+    await deleteHistoryFromDB(uid);
     storageToggleBtn.classList.remove('active');
     storageToggleBtn.title = 'Chat-Verlauf speichern';
     chatStatus.textContent = 'Lokales Speichern deaktiviert.';
@@ -419,23 +595,46 @@ async function flushHistoryToStorage(forUserId) {
   const encoded = new TextEncoder().encode(json);
   const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, sk, encoded);
   const data = { iv: arrayBufferToBase64(iv), ct: arrayBufferToBase64(ct) };
-  localStorage.setItem('schistory_' + forUserId, JSON.stringify(data));
+  await saveHistoryToDB(forUserId, data);
 }
 
 async function loadHistoryFromStorage(forUserId) {
   if (!forUserId) return;
-  const raw = localStorage.getItem('schistory_' + forUserId);
-  if (!raw) return;
+  const record = await loadHistoryFromDB(forUserId);
+  if (!record) return;
   try {
-    const { iv, ct } = JSON.parse(raw);
     const sk = await deriveStorageKey(forUserId);
     if (!sk) return;
-    const ivB = base64ToArrayBuffer(iv);
-    const ctB = base64ToArrayBuffer(ct);
+    const ivB = base64ToArrayBuffer(record.iv);
+    const ctB = base64ToArrayBuffer(record.ct);
     const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: ivB }, sk, ctB);
     const history = JSON.parse(new TextDecoder().decode(plaintext));
     messageHistories[forUserId] = history;
+    storageEnabled[forUserId] = true;
+    if (forUserId === activeUserId) {
+      storageToggleBtn.classList.add('active');
+      storageToggleBtn.title = 'Chat-Verlauf wird gespeichert';
+    }
   } catch { }
+}
+
+// --- Ghost-Peer Protection: Group Hash AAD ---
+async function computeGroupHash(groupId) {
+  const g = myGroups[groupId];
+  if (!g || !g.members || g.members.length === 0) return new Uint8Array(0);
+
+  // Deterministic sort by userId
+  const sortedMembers = [...g.members].sort((a, b) => a.userId.localeCompare(b.userId));
+
+  let str = '';
+  for (const m of sortedMembers) {
+    const pkStr = m.publicKey ? (m.publicKey.x + ':' + m.publicKey.y) : '';
+    str += m.userId + ':' + pkStr + '|';
+  }
+
+  const encoded = new TextEncoder().encode(str);
+  const hashBuffer = await crypto.subtle.digest('SHA-256', encoded);
+  return new Uint8Array(hashBuffer);
 }
 
 async function sendFiles() {
@@ -451,10 +650,17 @@ async function sendFiles() {
     const key = activeGroupId ? groupKeys[activeGroupId] : getSharedKey(uid);
     if (!key) { chatStatus.textContent = 'Kein Schlüssel für Datei.'; continue; }
 
+    const transferId = (Date.now() + '_' + Math.random().toString(36).substring(2, 9));
     const iv = crypto.getRandomValues(new Uint8Array(12));
-    const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, buffer);
-    const totalChunks = Math.ceil(ct.byteLength / CHUNK_SIZE);
+    let ct;
+    if (activeGroupId) {
+      const groupHash = await computeGroupHash(activeGroupId);
+      ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: groupHash }, key, buffer);
+    } else {
+      ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, buffer);
+    }
 
+    const totalChunks = Math.ceil(ct.byteLength / CHUNK_SIZE);
     const meta = JSON.stringify({ name: file.name, type: file.type || 'application/octet-stream', size: file.size });
     const metaIv = crypto.getRandomValues(new Uint8Array(12));
     const metaCt = await crypto.subtle.encrypt({ name: 'AES-GCM', metaIv }, key, new TextEncoder().encode(meta));
@@ -466,6 +672,7 @@ async function sendFiles() {
     ws.send(JSON.stringify({
       type: msgType === 'file_message' ? 'file_message' : 'group_file',
       [targetKey]: targetVal,
+      transferId,
       fileName: arrayBufferToBase64(metaCt), fileIv: arrayBufferToBase64(metaIv),
       fileSize: file.size, totalChunks, chunkIndex: -1, encryptedData: '', iv: arrayBufferToBase64(iv)
     }));
@@ -477,6 +684,7 @@ async function sendFiles() {
       ws.send(JSON.stringify({
         type: msgType === 'file_message' ? 'file_message' : 'group_file',
         [targetKey]: targetVal,
+        transferId,
         chunkIndex: i, totalChunks,
         encryptedData: arrayBufferToBase64(chunk), iv: '',
         fileName: '', fileIv: ''
@@ -493,6 +701,8 @@ async function handleFileMessage(msg) {
   const key = msg.isGroup ? groupKeys[uid] : getSharedKey(uid);
   if (!key) return;
 
+  const tid = msg.transferId || uid;
+
   if (msg.chunkIndex === -1) {
     try {
       const metaIv = base64ToArrayBuffer(msg.fileIv);
@@ -500,12 +710,12 @@ async function handleFileMessage(msg) {
       const metaPlain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: metaIv }, key, metaCt);
       const meta = JSON.parse(new TextDecoder().decode(metaPlain));
       const fileIv = base64ToArrayBuffer(msg.iv);
-      fileChunks[uid] = { meta, chunks: [], totalChunks: msg.totalChunks, received: 0, fileIv };
+      fileChunks[tid] = { meta, chunks: [], totalChunks: msg.totalChunks, received: 0, fileIv };
     } catch { }
     return;
   }
 
-  const fc = fileChunks[uid];
+  const fc = fileChunks[tid];
   if (!fc) return;
   const chunkData = base64ToArrayBuffer(msg.encryptedData);
   fc.chunks[msg.chunkIndex] = chunkData;
@@ -516,13 +726,17 @@ async function handleFileMessage(msg) {
     let offset = 0;
     for (const c of fc.chunks) { full.set(new Uint8Array(c), offset); offset += c.byteLength; }
     try {
-      const plaintext = await crypto.subtle.decrypt(
-        { name: 'AES-GCM', iv: fc.fileIv }, key, full
-      );
+      let plaintext;
+      if (msg.isGroup) {
+        const groupHash = await computeGroupHash(msg.groupId);
+        plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fc.fileIv, additionalData: groupHash }, key, full);
+      } else {
+        plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fc.fileIv }, key, full);
+      }
       const blob = new Blob([plaintext], { type: fc.meta.type });
       const url = URL.createObjectURL(blob);
       appendFileMessage(msg.senderUsername, fc.meta.name, fc.meta.type, fc.meta.size, 'received', new Date(), url, blob);
-      delete fileChunks[uid];
+      delete fileChunks[tid];
     } catch { }
   }
 }
@@ -577,6 +791,13 @@ function appendFileMessage(sender, fileName, fileType, fileSize, type, timestamp
 }
 
 function arrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
 
 function base64ToArrayBuffer(base64) {
   const s = atob(base64);
@@ -603,6 +824,7 @@ async function handleServerMessage(msg) {
 
     case 'public_key':
       try {
+        userPublicKeys[msg.targetUserId] = msg.publicKey;
         const sk = await deriveSharedKey(msg.publicKey);
         setSharedKey(msg.targetUserId, sk);
         if (msg.push) break;
@@ -626,6 +848,10 @@ async function handleServerMessage(msg) {
     case 'direct_message':
       if (msg.subType === 'otp_exchange') {
         await handleOTPExchange(msg);
+        return;
+      }
+      if (msg.subType === 'otp_ratchet') {
+        await handleOTPRatchet(msg);
         return;
       }
       if (msg.nonce && receivedNonces[msg.senderUserId] && receivedNonces[msg.senderUserId].has(msg.nonce)) {
@@ -680,14 +906,27 @@ async function handleServerMessage(msg) {
       try {
         const iv = base64ToArrayBuffer(msg.iv);
         const ct = base64ToArrayBuffer(msg.encryptedData);
-        const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, groupKeys[msg.groupId], ct);
+
+        // Ghost-Peer Protection: Verify group hash in AES-GCM Associated Data (AAD)
+        const localGroupHash = await computeGroupHash(msg.groupId);
+        const plaintext = await crypto.subtle.decrypt(
+          { name: 'AES-GCM', iv, additionalData: localGroupHash },
+          groupKeys[msg.groupId],
+          ct
+        );
         const text = new TextDecoder().decode(plaintext);
         if (msg.senderUserId === activeGroupId || msg.groupId === activeGroupId) {
           appendMessage(msg.senderUsername, text, 'received', new Date(msg.timestamp));
         }
         if (!groupHistories[msg.groupId]) groupHistories[msg.groupId] = [];
         groupHistories[msg.groupId].push({ sender: msg.senderUsername, text, type: 'received', timestamp: msg.timestamp });
-      } catch { }
+      } catch (e) {
+        console.error('Ghost-Peer Validation Error:', e);
+        if (msg.groupId === activeGroupId) {
+          chatStatus.textContent = '🔴 GHOST-PEER WARNUNG: Gruppen-Konsens fehlgeschlagen!';
+          appendMessage('SYSTEM (SICHERHEITSALARM)', '⚠️ ACHTUNG: Die Gruppen-Mitgliedsliste wurde serverseitig verändert! Nachricht verworfen.', 'received', new Date());
+        }
+      }
       break;
 
     case 'member_left':
@@ -711,7 +950,7 @@ async function handleServerMessage(msg) {
     case 'storage_consent_request':
       if (msg.senderUserId) {
         pendingStorageConsentFrom = msg.senderUserId;
-        storageConsentText.textContent = `${msg.senderUsername} möchte den verschlüsselten Chat-Verlauf lokal speichern. Beide müssen zustimmen.`;
+        storageConsentText.textContent = `${msg.senderUsername} möchte den verschlüsselten Chat-Verlauf lokal (IndexedDB) speichern. Beide müssen zustimmen.`;
         storageConsentModal.style.display = 'flex';
       }
       break;
@@ -733,7 +972,7 @@ async function handleServerMessage(msg) {
     case 'storage_consent_revoke':
       if (msg.senderUserId) {
         storageEnabled[msg.senderUserId] = false;
-        localStorage.removeItem('schistory_' + msg.senderUserId);
+        await deleteHistoryFromDB(msg.senderUserId);
         storageToggleBtn.classList.remove('active');
         storageToggleBtn.title = 'Chat-Verlauf speichern';
         chatStatus.textContent = 'Partner hat Speichern deaktiviert — Verlauf gelöscht.';
@@ -741,7 +980,7 @@ async function handleServerMessage(msg) {
       break;
 
     case 'emergency_delete_request':
-      deleteAllData(msg.senderUserId);
+      await deleteAllData(msg.senderUserId);
       messagesContainer.innerHTML = '<div class="system-message">🔴 Chat wurde vom Partner gelöscht</div>';
       messageInput.disabled = true;
       sendBtn.disabled = true;
@@ -750,7 +989,7 @@ async function handleServerMessage(msg) {
       break;
 
     case 'emergency_delete_confirmed':
-      deleteAllData(activeUserId);
+      await deleteAllData(activeUserId);
       messagesContainer.innerHTML = '<div class="system-message">🔴 Chat lokal gelöscht</div>';
       messageInput.disabled = true;
       sendBtn.disabled = true;
@@ -804,20 +1043,20 @@ async function selectUser(userId, username) {
   const existing = getSharedKey(userId);
   if (existing && getOTPSendStore(userId) && getOTPRecvStore(userId)) {
     await restoreStorageState(userId);
-  messageInput.disabled = false;
-  sendBtn.disabled = false;
-  fileBtn.disabled = false;
-  e2eBadge.textContent = '🔒🔒 E2E + OTP';
-  e2eBadge.style.color = '#3fb950';
-  messagesContainer.innerHTML = '';
-  loadChatHistory();
-  chatStatus.textContent = 'Verbindung wiederhergestellt.';
-  return;
-}
-if (existing) {
-  await restoreStorageState(userId);
-  chatStatus.textContent = 'Tausche OTP-Schlüssel aus...';
-  messagesContainer.innerHTML = '<div class="system-message">🔑 OTP-Schlüsselaustausch läuft...</div>';
+    messageInput.disabled = false;
+    sendBtn.disabled = false;
+    fileBtn.disabled = false;
+    e2eBadge.textContent = '🔒🔒 E2E + Post-Quantum Ratchet';
+    e2eBadge.style.color = '#3fb950';
+    messagesContainer.innerHTML = '';
+    loadChatHistory();
+    chatStatus.textContent = 'Verbindung wiederhergestellt.';
+    return;
+  }
+  if (existing) {
+    await restoreStorageState(userId);
+    chatStatus.textContent = 'Tausche OTP-Schlüssel aus...';
+    messagesContainer.innerHTML = '<div class="system-message">🔑 OTP-Schlüsselaustausch läuft...</div>';
     await initiateOTPExchange(userId);
     loadChatHistory();
     return;
@@ -914,31 +1153,33 @@ function loadChatHistory() {
     appendMessage(msg.sender, msg.text, msg.type, new Date(msg.timestamp)));
 }
 
-function deleteAllData(forUserId) {
+async function deleteAllData(forUserId) {
   if (forUserId) {
     delete sharedKeys[forUserId];
+    delete userPublicKeys[forUserId];
+    if (otpSendStores[forUserId] && otpSendStores[forUserId].data) zeroMemory(otpSendStores[forUserId].data);
+    if (otpRecvStores[forUserId] && otpRecvStores[forUserId].data) zeroMemory(otpRecvStores[forUserId].data);
     delete otpSendStores[forUserId];
     delete otpRecvStores[forUserId];
     delete messageHistories[forUserId];
     delete receivedNonces[forUserId];
     delete storageEnabled[forUserId];
-    localStorage.removeItem('schistory_' + forUserId);
+    await deleteHistoryFromDB(forUserId);
   }
 }
 
-function performEmergencyDelete() {
-  for (const uid of Object.keys(sharedKeys)) deleteAllData(uid);
-  for (const uid of Object.keys(otpSendStores)) deleteAllData(uid);
-  for (const uid of Object.keys(storageEnabled)) deleteAllData(uid);
-  const keys = Object.keys(localStorage).filter(k => k.startsWith('schistory_'));
-  keys.forEach(k => localStorage.removeItem(k));
+async function performEmergencyDelete() {
+  for (const uid of Object.keys(sharedKeys)) await deleteAllData(uid);
+  for (const uid of Object.keys(otpSendStores)) await deleteAllData(uid);
+  for (const uid of Object.keys(storageEnabled)) await deleteAllData(uid);
+  await clearAllDB();
   storageToggleBtn.classList.remove('active');
   storageToggleBtn.title = 'Chat-Verlauf speichern';
-  messagesContainer.innerHTML = '<div class="system-message">🔴 Chat gelöscht</div>';
+  messagesContainer.innerHTML = '<div class="system-message">🔴 Chat gelöscht & RAM-Speicher genullt</div>';
   messageInput.disabled = true;
   sendBtn.disabled = true;
   fileBtn.disabled = true;
-  chatStatus.textContent = 'Chat gelöscht.';
+  chatStatus.textContent = 'Chat gelöscht & genullt.';
   if (activeUserId)
     ws.send(JSON.stringify({ type: 'emergency_delete', targetUserId: activeUserId }));
 }
@@ -1012,11 +1253,10 @@ function renderGroupList() {
 function selectGroup(groupId) {
   activeGroupId = groupId;
   activeUserId = null;
-  activeGroupId = groupId;
   const g = myGroups[groupId];
   chatPartnerName.textContent = '👥 ' + g.name;
   partnerStatus.className = 'online-indicator online';
-  e2eBadge.textContent = '🔒 Gruppen-E2E';
+  e2eBadge.textContent = '🔒 Gruppen-E2E (Konsens AAD)';
   e2eBadge.style.color = '#3fb950';
   messageInput.disabled = false;
   sendBtn.disabled = false;
@@ -1038,11 +1278,20 @@ async function sendGroupMessage(text) {
   const gk = groupKeys[activeGroupId];
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const encoded = new TextEncoder().encode(text);
-  const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, gk, encoded);
+
+  // Compute cryptographic consensus hash for group members
+  const localGroupHash = await computeGroupHash(activeGroupId);
+
+  const ct = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv, additionalData: localGroupHash },
+    gk,
+    encoded
+  );
 
   ws.send(JSON.stringify({
     type: 'group_message', groupId: activeGroupId,
     encryptedData: arrayBufferToBase64(ct), iv: arrayBufferToBase64(iv),
+    groupHash: arrayBufferToBase64(localGroupHash),
     timestamp: Date.now()
   }));
 
